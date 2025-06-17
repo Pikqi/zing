@@ -11,6 +11,8 @@ const ICMPPacket = packed struct {
     data: u448 = 0,
 };
 
+const PingStatus = enum { OK, TIMEOUT, BAD_SUM };
+
 const MAX_SEQUENCE = 10;
 const socket_t = pos.socket_t;
 
@@ -30,6 +32,8 @@ pub fn main() !void {
     const addr = try std.net.Ip4Address.resolveIp(ipstr, 0);
     const saddr: pos.sockaddr = @bitCast(addr.sa);
 
+    std.debug.print("PING {s} {d} bytes of data.", .{ ipstr, @sizeOf(ICMPPacket) + 20 });
+
     var icmp = ICMPPacket{ .seq = sequence };
 
     for (0..MAX_SEQUENCE) |_| {
@@ -37,17 +41,26 @@ pub fn main() !void {
         populate_checksum(&icmp);
         const packet: [64]u8 = @bitCast(icmp);
         _ = try pos.sendto(sok, &packet, 64, &saddr, addr.getOsSockLen());
-        std.debug.print("\nSent ping seq={d}", .{sequence});
-        _ = try waitForEcho(sok, sequence, 0);
+        const start_time = std.time.milliTimestamp();
+        const status = try waitForEcho(sok, 0);
+        const end_time = std.time.milliTimestamp();
+        const rtt = end_time - start_time;
+        switch (status) {
+            .OK => std.debug.print("{s} responded, icmp_seq={d}  time={}ms\n", .{ ipstr, sequence, rtt }),
+            .BAD_SUM => std.debug.print("Bad checksum for icmp_seq={d}", .{sequence}),
+            .TIMEOUT => std.debug.print("Timeout for icmp_seq={d}", .{sequence}),
+        }
         sequence += 1;
         std.time.sleep(std.time.ns_per_s);
     }
 }
 
-fn waitForEcho(socket: socket_t, seq: u16, id: u16) !bool {
+fn waitForEcho(socket: socket_t, id: u16) !PingStatus {
     _ = id;
     var buff: [512]u8 = std.mem.zeroes([512]u8);
     var offset: usize = 0;
+
+    std.time.sleep(std.time.ns_per_s / 100);
     for (0..10) |_| {
         const bytesRead = pos.recv(socket, buff[offset..], pos.MSG.DONTWAIT) catch 0;
         offset += bytesRead;
@@ -60,15 +73,16 @@ fn waitForEcho(socket: socket_t, seq: u16, id: u16) !bool {
             std.mem.copyForwards(u8, &replyICMPbytes, buff[header_size .. header_size + 64]);
             var replyICMP: ICMPPacket = @bitCast(replyICMPbytes);
             const ok = check_checksum(&replyICMP);
-            std.debug.print("seq: {} ok: {}", .{ seq, ok });
-
-            return true;
+            if (ok) {
+                return .OK;
+            } else {
+                return .BAD_SUM;
+            }
         }
         std.time.sleep(std.time.ns_per_s / 10);
     }
 
-    std.debug.print("seq: {} timeout", .{seq});
-    return false;
+    return .TIMEOUT;
 }
 
 fn populate_checksum(icmp: *ICMPPacket) void {
