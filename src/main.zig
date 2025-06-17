@@ -35,10 +35,39 @@ pub fn main() !void {
     const sizesent = try pos.sendto(sok, &packet, 64, &saddr, addr.getOsSockLen());
 
     std.debug.print("s: {d} soket: {d}", .{ sizesent, sok });
-    std.debug.print("{d}", .{packet});
+    var buff: [512]u8 = std.mem.zeroes([512]u8);
+    for (0..10) |_| {
+        const bytesRead = try pos.recvfrom(sok, &buff, 0, null, null);
+        if (bytesRead > 0) {
+
+            // skip ahead of ipv4 header
+            const header_size: u8 = (buff[0] & 0x0F) * 4;
+            std.debug.print("hs: {d}", .{header_size});
+
+            var replyICMPbytes: [@sizeOf(ICMPPacket)]u8 = undefined;
+            std.mem.copyForwards(u8, &replyICMPbytes, buff[header_size .. header_size + 64]);
+            var replyICMP: ICMPPacket = @bitCast(replyICMPbytes);
+            const ok = check_checksum(&replyICMP);
+            std.debug.print("ok: {}", .{ok});
+
+            break;
+        }
+        std.time.sleep(std.time.ns_per_s / 10);
+    }
 }
 
 fn populate_checksum(icmp: *ICMPPacket) void {
+    icmp.checksum = calculate_checksum(icmp);
+}
+fn check_checksum(icmp: *ICMPPacket) bool {
+    const old_sum = icmp.checksum;
+    icmp.checksum = 0;
+    defer icmp.checksum = old_sum;
+    const calculated_sum = calculate_checksum(icmp);
+
+    return calculated_sum == old_sum;
+}
+fn calculate_checksum(icmp: *ICMPPacket) u16 {
     const array: [@sizeOf(ICMPPacket)]u8 = @bitCast(icmp.*);
     var sum: u16 = 0;
     var i: usize = 0;
@@ -51,5 +80,5 @@ fn populate_checksum(icmp: *ICMPPacket) void {
 
     const lowerByte = @as(u8, @intCast(~sum & 0xFF));
     const upperByte = @as(u8, @intCast(~sum >> 8));
-    icmp.checksum = @bitCast([_]u8{ upperByte, lowerByte });
+    return @bitCast([_]u8{ upperByte, lowerByte });
 }
