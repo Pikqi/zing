@@ -11,8 +11,11 @@ const ICMPPacket = packed struct {
     data: u448 = 0,
 };
 
+const MAX_SEQUENCE = 10;
+const socket_t = pos.socket_t;
+
 pub fn main() !void {
-    const sequence: u16 = 0;
+    var sequence: u16 = 0;
     const sok = std.posix.socket(pos.AF.INET, pos.SOCK.RAW, pos.IPPROTO.ICMP) catch {
         std.debug.print("Couldn't open raw socket, do you have privilages?", .{});
         return;
@@ -28,35 +31,48 @@ pub fn main() !void {
     const saddr: pos.sockaddr = @bitCast(addr.sa);
 
     var icmp = ICMPPacket{ .seq = sequence };
-    populate_checksum(&icmp);
 
-    const packet: [64]u8 = @bitCast(icmp);
+    for (0..MAX_SEQUENCE) |_| {
+        icmp.seq = sequence;
+        populate_checksum(&icmp);
+        const packet: [64]u8 = @bitCast(icmp);
+        _ = try pos.sendto(sok, &packet, 64, &saddr, addr.getOsSockLen());
+        std.debug.print("\nSent ping seq={d}", .{sequence});
+        _ = try waitForEcho(sok, sequence, 0);
+        sequence += 1;
+        std.time.sleep(std.time.ns_per_s);
+    }
+}
 
-    const sizesent = try pos.sendto(sok, &packet, 64, &saddr, addr.getOsSockLen());
-
-    std.debug.print("s: {d} soket: {d}", .{ sizesent, sok });
+fn waitForEcho(socket: socket_t, seq: u16, id: u16) !bool {
+    _ = id;
     var buff: [512]u8 = std.mem.zeroes([512]u8);
+    var offset: usize = 0;
     for (0..10) |_| {
-        const bytesRead = try pos.recvfrom(sok, &buff, 0, null, null);
-        if (bytesRead > 0) {
+        const bytesRead = pos.recv(socket, buff[offset..], pos.MSG.DONTWAIT) catch 0;
+        offset += bytesRead;
+        if (offset >= 20) {
 
             // skip ahead of ipv4 header
             const header_size: u8 = (buff[0] & 0x0F) * 4;
-            std.debug.print("hs: {d}", .{header_size});
 
             var replyICMPbytes: [@sizeOf(ICMPPacket)]u8 = undefined;
             std.mem.copyForwards(u8, &replyICMPbytes, buff[header_size .. header_size + 64]);
             var replyICMP: ICMPPacket = @bitCast(replyICMPbytes);
             const ok = check_checksum(&replyICMP);
-            std.debug.print("ok: {}", .{ok});
+            std.debug.print("seq: {} ok: {}", .{ seq, ok });
 
-            break;
+            return true;
         }
         std.time.sleep(std.time.ns_per_s / 10);
     }
+
+    std.debug.print("seq: {} timeout", .{seq});
+    return false;
 }
 
 fn populate_checksum(icmp: *ICMPPacket) void {
+    icmp.checksum = 0;
     icmp.checksum = calculate_checksum(icmp);
 }
 fn check_checksum(icmp: *ICMPPacket) bool {
