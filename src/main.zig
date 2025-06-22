@@ -12,61 +12,90 @@ const ICMPPacket = packed struct {
 };
 
 const PingStatus = enum { OK, TIMEOUT, BAD_SUM };
+const EchoResult = struct {
+    sequence: u16 = 0,
+    status: PingStatus,
+    numbytes: usize,
+};
+
+const PingThread = struct {
+    thread: std.Thread,
+    status: PingStatus = .TIMEOUT,
+    rtt: f32 = 0,
+    sequence: u16,
+};
 
 const MAX_SEQUENCE = 10;
 const socket_t = pos.socket_t;
 
+const ipstr = "1.1.1.1";
+const ttl_val: [4]u8 = .{ 64, 0, 0, 0 };
+
+var pings: [MAX_SEQUENCE]PingThread = undefined;
 pub fn main() !void {
-    var sequence: u16 = 0;
+    var pings_sent: u16 = 0;
+
+    std.debug.print("PING {s} {d} bytes of data.\n", .{ ipstr, @sizeOf(ICMPPacket) + 20 });
+    for (0..MAX_SEQUENCE) |seq| {
+        pings[seq] = PingThread{ .sequence = @as(u16, @intCast(seq)), .thread = undefined };
+        const t = try std.Thread.spawn(.{}, sendICMP, .{@as(u16, @intCast(seq))});
+        pings[seq].thread = t;
+
+        pings_sent += 1;
+        std.time.sleep(std.time.ns_per_s / 2);
+    }
+    var sum: f32 = 0.0;
+    for (0..pings_sent) |i| {
+        pings[i].thread.join();
+        sum += pings[i].rtt;
+    }
+    const avg: f32 = sum / @as(f32, @floatFromInt(pings_sent));
+    std.debug.print("Statistics, average response time: {d:.3}ms", .{avg});
+}
+
+fn sendICMP(seq: u16) !void {
     const sok = std.posix.socket(pos.AF.INET, pos.SOCK.RAW, pos.IPPROTO.ICMP) catch {
         std.debug.print("Couldn't open raw socket, do you have privilages?", .{});
         return;
     };
-
-    const ttl_val: [4]u8 = .{ 64, 0, 0, 0 };
-    try pos.setsockopt(sok, pos.SOL.IP, 2, ttl_val[0..]);
-    defer pos.close(sok);
-
-    const ipstr = "1.1.1.1";
-    // const ipstr = "192.168.8.8";
-
     const addr = try std.net.Ip4Address.resolveIp(ipstr, 0);
     const saddr: pos.sockaddr = @bitCast(addr.sa);
 
-    std.debug.print("PING {s} {d} bytes of data.", .{ ipstr, @sizeOf(ICMPPacket) + 20 });
+    try pos.setsockopt(sok, pos.SOL.IP, 2, ttl_val[0..]);
+    defer pos.close(sok);
 
-    var icmp = ICMPPacket{ .seq = sequence };
+    var icmp = ICMPPacket{ .seq = seq };
 
-    for (0..MAX_SEQUENCE) |_| {
-        icmp.seq = sequence;
-        populate_checksum(&icmp);
-        const packet: [64]u8 = @bitCast(icmp);
-        _ = try pos.sendto(sok, &packet, 64, &saddr, addr.getOsSockLen());
-        const start_time = std.time.microTimestamp();
-        const status = try waitForEcho(sok, 0);
-        const end_time = std.time.microTimestamp();
-        const rtt: f32 = @as(f32, @floatFromInt(end_time - start_time)) / 1000.0;
-        switch (status) {
-            .OK => std.debug.print("{s} responded, icmp_seq={d}  time={d:.3}ms\n", .{ ipstr, sequence, rtt }),
-            .BAD_SUM => std.debug.print("Bad checksum for icmp_seq={d}", .{sequence}),
-            .TIMEOUT => std.debug.print("Timeout for icmp_seq={d}", .{sequence}),
-        }
-        sequence += 1;
-        std.time.sleep(std.time.ns_per_s);
+    populate_checksum(&icmp);
+    const packet: [64]u8 = @bitCast(icmp);
+    _ = try pos.sendto(sok, &packet, 64, &saddr, addr.getOsSockLen());
+    const start_time = std.time.microTimestamp();
+    const echo = try waitForEcho(sok);
+    const end_time = std.time.microTimestamp();
+    const rtt: f32 = @as(f32, @floatFromInt(end_time - start_time)) / 1000.0;
+    var pingThread = &pings[echo.sequence];
+    pingThread.rtt = rtt;
+    pingThread.status = echo.status;
+    switch (echo.status) {
+        .OK => std.debug.print("{s} responded with {d} bytes, icmp_seq={d}  time={d:.3}ms\n", .{ ipstr, echo.numbytes, pingThread.sequence, rtt }),
+        .BAD_SUM => std.debug.print("Bad checksum for icmp_seq={d}", .{pingThread.sequence}),
+        .TIMEOUT => std.debug.print("Timeout for icmp_seq={d}", .{pingThread.sequence}),
     }
 }
 
-fn waitForEcho(socket: socket_t, id: u16) !PingStatus {
-    _ = id;
+fn waitForEcho(socket: socket_t) !EchoResult {
+    var result = EchoResult{ .status = .TIMEOUT, .numbytes = 0 };
     var buff: [512]u8 = std.mem.zeroes([512]u8);
     var offset: usize = 0;
 
     var fds = [_]pos.pollfd{pos.pollfd{ .fd = socket, .events = 0, .revents = 0 }};
     const status = try pos.poll(fds[0..1], 0);
+
     if (status != -1) {
         const bytesRead = pos.recv(socket, buff[offset..], 0) catch 0;
         offset += bytesRead;
         if (offset >= 20) {
+            result.numbytes = offset;
 
             // skip ahead of ipv4 header
             const header_size: u8 = (buff[0] & 0x0F) * 4;
@@ -74,16 +103,19 @@ fn waitForEcho(socket: socket_t, id: u16) !PingStatus {
             var replyICMPbytes: [@sizeOf(ICMPPacket)]u8 = undefined;
             std.mem.copyForwards(u8, &replyICMPbytes, buff[header_size .. header_size + 64]);
             var replyICMP: ICMPPacket = @bitCast(replyICMPbytes);
+
+            result.sequence = replyICMP.seq;
+
             const ok = check_checksum(&replyICMP);
             if (ok) {
-                return .OK;
+                result.status = .OK;
             } else {
-                return .BAD_SUM;
+                result.status = .BAD_SUM;
             }
         }
     }
 
-    return .TIMEOUT;
+    return result;
 }
 
 fn populate_checksum(icmp: *ICMPPacket) void {
