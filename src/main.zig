@@ -28,6 +28,7 @@ pub fn main() !void {
     defer pos.close(sok);
 
     const ipstr = "1.1.1.1";
+    // const ipstr = "192.168.8.8";
 
     const addr = try std.net.Ip4Address.resolveIp(ipstr, 0);
     const saddr: pos.sockaddr = @bitCast(addr.sa);
@@ -41,12 +42,12 @@ pub fn main() !void {
         populate_checksum(&icmp);
         const packet: [64]u8 = @bitCast(icmp);
         _ = try pos.sendto(sok, &packet, 64, &saddr, addr.getOsSockLen());
-        const start_time = std.time.milliTimestamp();
+        const start_time = std.time.microTimestamp();
         const status = try waitForEcho(sok, 0);
-        const end_time = std.time.milliTimestamp();
-        const rtt = end_time - start_time;
+        const end_time = std.time.microTimestamp();
+        const rtt: f32 = @as(f32, @floatFromInt(end_time - start_time)) / 1000.0;
         switch (status) {
-            .OK => std.debug.print("{s} responded, icmp_seq={d}  time={}ms\n", .{ ipstr, sequence, rtt }),
+            .OK => std.debug.print("{s} responded, icmp_seq={d}  time={d:.3}ms\n", .{ ipstr, sequence, rtt }),
             .BAD_SUM => std.debug.print("Bad checksum for icmp_seq={d}", .{sequence}),
             .TIMEOUT => std.debug.print("Timeout for icmp_seq={d}", .{sequence}),
         }
@@ -60,9 +61,10 @@ fn waitForEcho(socket: socket_t, id: u16) !PingStatus {
     var buff: [512]u8 = std.mem.zeroes([512]u8);
     var offset: usize = 0;
 
-    std.time.sleep(std.time.ns_per_s / 100);
-    for (0..10) |_| {
-        const bytesRead = pos.recv(socket, buff[offset..], pos.MSG.DONTWAIT) catch 0;
+    var fds = [_]pos.pollfd{pos.pollfd{ .fd = socket, .events = 0, .revents = 0 }};
+    const status = try pos.poll(fds[0..1], 0);
+    if (status != -1) {
+        const bytesRead = pos.recv(socket, buff[offset..], 0) catch 0;
         offset += bytesRead;
         if (offset >= 20) {
 
@@ -79,7 +81,6 @@ fn waitForEcho(socket: socket_t, id: u16) !PingStatus {
                 return .BAD_SUM;
             }
         }
-        std.time.sleep(std.time.ns_per_s / 10);
     }
 
     return .TIMEOUT;
